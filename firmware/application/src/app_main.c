@@ -48,6 +48,12 @@ NRF_LOG_MODULE_REGISTER();
 
 // Defining soft timers
 APP_TIMER_DEF(m_button_check_timer); // Timer for button debounce
+APP_TIMER_DEF(m_multi_click_timer);  // Timer for multi-click detection
+APP_TIMER_DEF(m_flashlight_timer);   // Timer for flashlight auto-off
+
+#define MULTI_CLICK_WINDOW_MS   350               // Max gap between clicks of a multi-click sequence
+#define FLASHLIGHT_CLICK_COUNT  3                 // Number of short clicks that turn on the flashlight
+#define FLASHLIGHT_TIMEOUT_MS   (5 * 60 * 1000)   // Flashlight auto-off delay
 
 static uint32_t m_last_btn_press = 0;
 
@@ -60,6 +66,15 @@ static bool m_is_b_btn_release = false;
 static bool m_is_a_btn_release = false;
 
 static bool m_system_off_processing = false;
+
+// Short clicks waiting for the multi-click window to close before being dispatched
+static char m_pending_click_btn = 0;
+static uint8_t m_pending_click_count = 0;
+static volatile bool m_is_multi_click_timeout = false;
+
+// White LED flashlight state
+volatile bool m_is_flashlight_on = false;
+static volatile bool m_is_flashlight_timeout = false;
 
 // NFC field generator state
 volatile bool m_is_field_on = false;
@@ -157,7 +172,7 @@ static void field_generator_rainbow_loop(void) {
     static uint8_t color_index = 0;
     static uint32_t last_update = 0;
 
-    if (!m_is_field_on) return;
+    if (!m_is_field_on || m_is_flashlight_on) return;
 
     uint32_t now = app_timer_cnt_get();
 
@@ -260,6 +275,18 @@ static void timer_button_event_handle(void *arg) {
     }
 }
 
+/** @brief Multi-click window timer, dispatching is done in the main loop
+ */
+static void timer_multi_click_handle(void *arg) {
+    m_is_multi_click_timeout = true;
+}
+
+/** @brief Flashlight auto-off timer, handled in the main loop
+ */
+static void timer_flashlight_handle(void *arg) {
+    m_is_flashlight_timeout = true;
+}
+
 /**@brief Function for init button and led.
  */
 static void button_init(void) {
@@ -267,6 +294,12 @@ static void button_init(void) {
 
     // Non-exact timer for initializing button anti-shake
     err_code = app_timer_create(&m_button_check_timer, APP_TIMER_MODE_SINGLE_SHOT, timer_button_event_handle);
+    APP_ERROR_CHECK(err_code);
+
+    err_code = app_timer_create(&m_multi_click_timer, APP_TIMER_MODE_SINGLE_SHOT, timer_multi_click_handle);
+    APP_ERROR_CHECK(err_code);
+
+    err_code = app_timer_create(&m_flashlight_timer, APP_TIMER_MODE_SINGLE_SHOT, timer_flashlight_handle);
     APP_ERROR_CHECK(err_code);
 
     // Configure SENSE mode, select false for sense configuration
@@ -914,32 +947,107 @@ static void run_button_function_by_settings(settings_button_function_t sbf) {
     }
 }
 
+/**@brief Turn on all LEDs in white
+ */
+static void flashlight_on(void) {
+    NRF_LOG_INFO("Flashlight ON");
+    m_is_flashlight_on = true;
+    m_is_flashlight_timeout = false;
+    rgb_marquee_stop();
+    set_slot_light_color(RGB_WHITE);
+    uint32_t *led_pins = hw_get_led_array();
+    for (int i = 0; i < RGB_LIST_NUM; i++) {
+        nrf_gpio_pin_set(led_pins[i]);
+    }
+    // Keep the device awake while lit, but don't drain the battery forever
+    sleep_timer_stop();
+    app_timer_start(m_flashlight_timer, APP_TIMER_TICKS(FLASHLIGHT_TIMEOUT_MS), NULL);
+}
+
+/**@brief Turn off the flashlight and restore the slot LED
+ */
+static void flashlight_off(void) {
+    NRF_LOG_INFO("Flashlight OFF");
+    app_timer_stop(m_flashlight_timer);
+    m_is_flashlight_on = false;
+    m_is_flashlight_timeout = false;
+    uint32_t *led_pins = hw_get_led_array();
+    for (int i = 0; i < RGB_LIST_NUM; i++) {
+        nrf_gpio_pin_clear(led_pins[i]);
+    }
+    set_slot_light_color(get_color_by_slot(tag_emulation_get_slot()));
+    light_up_by_slot();
+    if (!m_is_field_on) {
+        sleep_timer_start(SLEEP_DELAY_MS_BUTTON_CLICK);
+    }
+}
+
+/**@brief Run the short press function for every click that is waiting in the multi-click window
+ */
+static void flush_pending_clicks(void) {
+    app_timer_stop(m_multi_click_timer);
+    m_is_multi_click_timeout = false;
+    while (m_pending_click_count > 0) {
+        m_pending_click_count--;
+        run_button_function_by_settings(settings_get_button_press_config(m_pending_click_btn));
+    }
+}
+
+/**@brief Handle a released button: short clicks are buffered to detect the flashlight triple-click
+ * @param btn 'a' or 'b'
+ */
+static void button_release_process(char btn) {
+    // Any press while the flashlight is on just turns it off
+    if (m_is_flashlight_on) {
+        flashlight_off();
+        return;
+    }
+    if (m_is_btn_long_press) {
+        flush_pending_clicks();
+        run_button_function_by_settings(settings_get_long_button_press_config(btn));
+        return;
+    }
+    // Clicks on the other button end the current sequence
+    if (m_pending_click_count > 0 && m_pending_click_btn != btn) {
+        flush_pending_clicks();
+    }
+    m_pending_click_btn = btn;
+    m_pending_click_count++;
+    app_timer_stop(m_multi_click_timer);
+    m_is_multi_click_timeout = false;
+    if (m_pending_click_count >= FLASHLIGHT_CLICK_COUNT) {
+        m_pending_click_count = 0;
+        flashlight_on();
+    } else {
+        app_timer_start(m_multi_click_timer, APP_TIMER_TICKS(MULTI_CLICK_WINDOW_MS), NULL);
+    }
+}
+
 /**@brief button press event process
  */
 extern bool g_usb_led_marquee_enable;
 static void button_press_process(void) {
+    // The multi-click window closed, run the buffered short clicks
+    if (m_is_multi_click_timeout) {
+        flush_pending_clicks();
+    }
+    if (m_is_flashlight_timeout) {
+        flashlight_off();
+    }
     // Make sure that one of the AB buttons has a click event
     if (m_is_b_btn_release || m_is_a_btn_release) {
         if (m_is_a_btn_release) {
-            if (!m_is_btn_long_press) {
-                run_button_function_by_settings(settings_get_button_press_config('a'));
-            } else {
-                run_button_function_by_settings(settings_get_long_button_press_config('a'));
-            }
+            button_release_process('a');
             m_is_a_btn_release = false;
         }
         if (m_is_b_btn_release) {
-            if (!m_is_btn_long_press) {
-                run_button_function_by_settings(settings_get_button_press_config('b'));
-            } else {
-                run_button_function_by_settings(settings_get_long_button_press_config('b'));
-            }
+            button_release_process('b');
             m_is_b_btn_release = false;
         }
         // Disable led marquee for usb at button pressed.
         g_usb_led_marquee_enable = false;
-        // Re-delay into hibernation (unless field is on)
-        if (!m_is_field_on) {
+        // Re-delay into hibernation (unless field or flashlight is on)
+        if (!m_is_field_on && !m_is_flashlight_on) {
             sleep_timer_start(SLEEP_DELAY_MS_BUTTON_CLICK);
         }
     }
@@ -1046,8 +1154,8 @@ int main(void) {
         field_generator_rainbow_loop();
 #endif
 
-        // Led blink at usb status (only if field generator is off)
-        if (!m_is_field_on) {
+        // Led blink at usb status (only if field generator and flashlight are off)
+        if (!m_is_field_on && !m_is_flashlight_on) {
             blink_usb_led_status();
         }
 
