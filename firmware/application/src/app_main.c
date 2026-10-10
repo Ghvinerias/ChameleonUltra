@@ -947,6 +947,21 @@ static void run_button_function_by_settings(settings_button_function_t sbf) {
     }
 }
 
+/**@brief Set the drive strength of every LED pin
+ * @param drive NRF_GPIO_PIN_H0H1 for max brightness, NRF_GPIO_PIN_S0S1 for normal use
+ */
+static void flashlight_set_led_drive(nrf_gpio_pin_drive_t drive) {
+    uint32_t *led_pins = hw_get_led_array();
+    uint32_t *rgb_pins = hw_get_rgb_array();
+    for (int i = 0; i < RGB_LIST_NUM; i++) {
+        nrf_gpio_cfg(led_pins[i], NRF_GPIO_PIN_DIR_OUTPUT, NRF_GPIO_PIN_INPUT_DISCONNECT, NRF_GPIO_PIN_NOPULL, drive, NRF_GPIO_PIN_NOSENSE);
+    }
+    for (int i = 0; i < RGB_CTRL_NUM; i++) {
+        nrf_gpio_cfg(rgb_pins[i], NRF_GPIO_PIN_DIR_OUTPUT, NRF_GPIO_PIN_INPUT_DISCONNECT, NRF_GPIO_PIN_NOPULL, drive, NRF_GPIO_PIN_NOSENSE);
+    }
+    nrf_gpio_cfg(LED_FIELD, NRF_GPIO_PIN_DIR_OUTPUT, NRF_GPIO_PIN_INPUT_DISCONNECT, NRF_GPIO_PIN_NOPULL, drive, NRF_GPIO_PIN_NOSENSE);
+}
+
 /**@brief Turn on all LEDs in white
  */
 static void flashlight_on(void) {
@@ -954,11 +969,14 @@ static void flashlight_on(void) {
     m_is_flashlight_on = true;
     m_is_flashlight_timeout = false;
     rgb_marquee_stop();
+    // The RGB pins sink the current of all 8 LEDs at once, use high drive to keep them bright
+    flashlight_set_led_drive(NRF_GPIO_PIN_H0H1);
     set_slot_light_color(RGB_WHITE);
     uint32_t *led_pins = hw_get_led_array();
     for (int i = 0; i < RGB_LIST_NUM; i++) {
         nrf_gpio_pin_set(led_pins[i]);
     }
+    TAG_FIELD_LED_ON();
     // Keep the device awake while lit, but don't drain the battery forever
     sleep_timer_stop();
     app_timer_start(m_flashlight_timer, APP_TIMER_TICKS(FLASHLIGHT_TIMEOUT_MS), NULL);
@@ -975,6 +993,8 @@ static void flashlight_off(void) {
     for (int i = 0; i < RGB_LIST_NUM; i++) {
         nrf_gpio_pin_clear(led_pins[i]);
     }
+    TAG_FIELD_LED_OFF();
+    flashlight_set_led_drive(NRF_GPIO_PIN_S0S1);
     set_slot_light_color(get_color_by_slot(tag_emulation_get_slot()));
     light_up_by_slot();
     if (!m_is_field_on) {
