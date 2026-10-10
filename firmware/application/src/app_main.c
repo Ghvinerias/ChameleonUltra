@@ -172,7 +172,7 @@ static void field_generator_rainbow_loop(void) {
     static uint8_t color_index = 0;
     static uint32_t last_update = 0;
 
-    if (!m_is_field_on || m_is_flashlight_on) return;
+    if (!m_is_field_on) return;
 
     uint32_t now = app_timer_cnt_get();
 
@@ -947,56 +947,29 @@ static void run_button_function_by_settings(settings_button_function_t sbf) {
     }
 }
 
-/**@brief Set the drive strength of every LED pin
- * @param drive NRF_GPIO_PIN_H0H1 for max brightness, NRF_GPIO_PIN_S0S1 for normal use
- */
-static void flashlight_set_led_drive(nrf_gpio_pin_drive_t drive) {
-    uint32_t *led_pins = hw_get_led_array();
-    uint32_t *rgb_pins = hw_get_rgb_array();
-    for (int i = 0; i < RGB_LIST_NUM; i++) {
-        nrf_gpio_cfg(led_pins[i], NRF_GPIO_PIN_DIR_OUTPUT, NRF_GPIO_PIN_INPUT_DISCONNECT, NRF_GPIO_PIN_NOPULL, drive, NRF_GPIO_PIN_NOSENSE);
-    }
-    for (int i = 0; i < RGB_CTRL_NUM; i++) {
-        nrf_gpio_cfg(rgb_pins[i], NRF_GPIO_PIN_DIR_OUTPUT, NRF_GPIO_PIN_INPUT_DISCONNECT, NRF_GPIO_PIN_NOPULL, drive, NRF_GPIO_PIN_NOSENSE);
-    }
-    nrf_gpio_cfg(LED_FIELD, NRF_GPIO_PIN_DIR_OUTPUT, NRF_GPIO_PIN_INPUT_DISCONNECT, NRF_GPIO_PIN_NOPULL, drive, NRF_GPIO_PIN_NOSENSE);
-}
-
-/**@brief Turn on all LEDs in white
+/**@brief Turn on the field LED as a flashlight
  */
 static void flashlight_on(void) {
     NRF_LOG_INFO("Flashlight ON");
     m_is_flashlight_on = true;
     m_is_flashlight_timeout = false;
-    rgb_marquee_stop();
-    // The RGB pins sink the current of all 8 LEDs at once, use high drive to keep them bright
-    flashlight_set_led_drive(NRF_GPIO_PIN_H0H1);
-    set_slot_light_color(RGB_WHITE);
-    uint32_t *led_pins = hw_get_led_array();
-    for (int i = 0; i < RGB_LIST_NUM; i++) {
-        nrf_gpio_pin_set(led_pins[i]);
-    }
+    // Use high drive for max brightness
+    nrf_gpio_cfg(LED_FIELD, NRF_GPIO_PIN_DIR_OUTPUT, NRF_GPIO_PIN_INPUT_DISCONNECT, NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_H0H1, NRF_GPIO_PIN_NOSENSE);
     TAG_FIELD_LED_ON();
     // Keep the device awake while lit, but don't drain the battery forever
     sleep_timer_stop();
     app_timer_start(m_flashlight_timer, APP_TIMER_TICKS(FLASHLIGHT_TIMEOUT_MS), NULL);
 }
 
-/**@brief Turn off the flashlight and restore the slot LED
+/**@brief Turn off the flashlight
  */
 static void flashlight_off(void) {
     NRF_LOG_INFO("Flashlight OFF");
     app_timer_stop(m_flashlight_timer);
     m_is_flashlight_on = false;
     m_is_flashlight_timeout = false;
-    uint32_t *led_pins = hw_get_led_array();
-    for (int i = 0; i < RGB_LIST_NUM; i++) {
-        nrf_gpio_pin_clear(led_pins[i]);
-    }
     TAG_FIELD_LED_OFF();
-    flashlight_set_led_drive(NRF_GPIO_PIN_S0S1);
-    set_slot_light_color(get_color_by_slot(tag_emulation_get_slot()));
-    light_up_by_slot();
+    nrf_gpio_cfg_output(LED_FIELD);
     if (!m_is_field_on) {
         sleep_timer_start(SLEEP_DELAY_MS_BUTTON_CLICK);
     }
@@ -1053,6 +1026,10 @@ static void button_press_process(void) {
     }
     if (m_is_flashlight_timeout) {
         flashlight_off();
+    }
+    // The field LED is also driven by field detection, keep it lit while the flashlight is on
+    if (m_is_flashlight_on) {
+        TAG_FIELD_LED_ON();
     }
     // Make sure that one of the AB buttons has a click event
     if (m_is_b_btn_release || m_is_a_btn_release) {
@@ -1174,8 +1151,8 @@ int main(void) {
         field_generator_rainbow_loop();
 #endif
 
-        // Led blink at usb status (only if field generator and flashlight are off)
-        if (!m_is_field_on && !m_is_flashlight_on) {
+        // Led blink at usb status (only if field generator is off)
+        if (!m_is_field_on) {
             blink_usb_led_status();
         }
 
